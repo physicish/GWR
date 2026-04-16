@@ -15,8 +15,8 @@ The Gravitaitonal-wave Revolution Companion Code repository.
 
 ## Recommended workflow
 
-1. The `main` branch conatins the top-level chapter folders.
-2. The `main` branch is protected so changes are merged through pull requests rather than pushed directly.
+1. The `main` branch contains the top-level chapter folders.
+2. The `main` branch is protected, so changes are merged through pull requests rather than pushed directly.
 3. Before starting work, update your local copy from `main`.
 4. Create a new branch from `main` for your work. Use a clear branch name such as: `chapter-03`, `chapter-03-revisions`, etc.
 5. Add or update files only in your chapter folder.
