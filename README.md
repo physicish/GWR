@@ -1,6 +1,6 @@
 # About the repository
 
-The Gravitaitonal-wave Revolution Companion Code repository.
+The Gravitational-wave Revolution Companion Code repository.
 
 # Deadlines
 
