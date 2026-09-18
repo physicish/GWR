@@ -36,7 +36,9 @@ HOW TO RUN
     # Choose the output name, the SNR and which example to show
     python plot_dataset.py data_gaussian.h5 -o figures/gaussian --snr 12 --index 7
 
-    # Inspect the validation split instead
+    # Inspect the validation split instead. Note this split exists only if
+    # generate_dataset.py was run with --validation-samples; by default the
+    # generated file contains a training split only.
     python plot_dataset.py data_gaussian.h5 --group validation
 
     # Print the file contents without plotting
@@ -46,6 +48,7 @@ HOW TO RUN
 
 from argparse import ArgumentParser
 import os
+import sys
 
 import h5py
 import matplotlib
@@ -259,7 +262,10 @@ def main():
                              "<stem>_examples.png and <stem>_diagnostics.png. "
                              "Default: the input filename without its extension.")
     parser.add_argument("-g", "--group", type=str, default="training",
-                        help="Which split to plot. Default: training.")
+                        help="Which split to plot. Default: training. The "
+                             "'validation' split is present only if "
+                             "generate_dataset.py was run with "
+                             "--validation-samples.")
     parser.add_argument("--snr", type=float, default=15.0,
                         help="Network SNR at which to inject the example "
                              "signal. Default: 15.")
@@ -277,7 +283,18 @@ def main():
     if args.summary_only:
         return
 
-    noises, waveforms, attrs = load_split(args.input_file, args.group)
+    try:
+        noises, waveforms, attrs = load_split(args.input_file, args.group)
+    except KeyError as exc:
+        # Most commonly: asking for 'validation' in a file generated without
+        # --validation-samples. Report it plainly rather than as a traceback.
+        print(f"\nError: {exc.args[0]}", file=sys.stderr)
+        if args.group == "validation":
+            print("Hint: regenerate with "
+                  "'--validation-samples N_INJ N_NOISE' to create this split.",
+                  file=sys.stderr)
+        sys.exit(1)
+
     if waveforms.shape[0] == 0:
         raise ValueError(f"Group '{args.group}' contains no injections to plot.")
     if not 0 <= args.index < waveforms.shape[0]:

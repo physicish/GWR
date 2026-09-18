@@ -33,8 +33,13 @@ HOW TO RUN
 ------------------------------------------------------------------------------
 Requires: pycbc, numpy, h5py, tqdm  (pip install pycbc h5py tqdm)
 
-    # Gaussian noise coloured by the analytic aLIGO design PSD (chapter step 1)
+    # Gaussian noise coloured by the analytic aLIGO design PSD (chapter step 1).
+    # Writes a TRAINING split only.
     python generate_dataset.py -o data_gaussian.h5 --verbose
+
+    # Add a validation split. This is opt-in: omit the flag and none is written.
+    python generate_dataset.py -o data_gaussian.h5 --verbose \
+        --validation-samples 2000 2000
 
     # Smaller, faster run for a first look
     python generate_dataset.py -o data_small.h5 \
@@ -559,9 +564,11 @@ def main():
                         help="Number of training injections and pure-noise "
                              "samples. Default: 10000 10000.")
     parser.add_argument("--validation-samples", type=int, nargs=2,
-                        default=[2000, 2000], metavar=("N_INJ", "N_NOISE"),
+                        default=None, metavar=("N_INJ", "N_NOISE"),
                         help="Number of validation injections and pure-noise "
-                             "samples. Default: 2000 2000.")
+                             "samples. OPTIONAL: if this flag is omitted, no "
+                             "validation split is written. Example: "
+                             "--validation-samples 2000 2000.")
     parser.add_argument("--psd-file", type=str, default=None,
                         help="HDF5 file of measured PSDs for Gaussian noise "
                              "generation. Default: analytic aLIGOZeroDetHighPower.")
@@ -641,13 +648,19 @@ def main():
                 outfile.attrs[f"{label}_sha256"] = sha256_file(path)
                 outfile.attrs[f"{label}_path"] = os.path.abspath(path)
 
-    logging.info("Generating validation dataset.")
-    valid_ds = generate_dataset(
-        args.validation_samples, detectors, noise_getter_iter, rng,
-        approximant=args.approximant, sample_length=args.sample_length,
-        verbose=args.verbose)
-    with h5py.File(args.output_file, "a") as outfile:
-        valid_ds.save(outfile, "validation")
+    # The validation split is opt-in: it is written only when
+    # --validation-samples is supplied on the command line.
+    if args.validation_samples is not None:
+        logging.info("Generating validation dataset.")
+        valid_ds = generate_dataset(
+            args.validation_samples, detectors, noise_getter_iter, rng,
+            approximant=args.approximant, sample_length=args.sample_length,
+            verbose=args.verbose)
+        with h5py.File(args.output_file, "a") as outfile:
+            valid_ds.save(outfile, "validation")
+    else:
+        logging.info("No validation split requested; pass --validation-samples "
+                     "N_INJ N_NOISE to add one.")
 
     logging.info("Wrote %s", args.output_file)
 
