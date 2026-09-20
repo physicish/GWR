@@ -13,7 +13,9 @@ Two figures are produced.
 
 2. ``<stem>_diagnostics.png`` -- four checks that the generation worked.
    (a) Whitened noise amplitude distribution, against a unit Gaussian.
-       Whitening should leave noise with approximately zero mean, unit variance.
+       Whitening leaves noise Gaussian in shape with zero mean. Note the
+       amplitude is NOT unity: pycbc's convention gives sqrt(f_s/2), about 32
+       at 2048 Hz, so the distribution is normalised by its own sigma here.
    (b) Amplitude spectral density of the whitened noise. It should be FLAT
        above the 20 Hz cutoff and suppressed below it. A sloped spectrum means
        the whitening PSD did not match the noise.
@@ -55,6 +57,29 @@ import matplotlib
 matplotlib.use("Agg")           # render to file; no interactive display needed
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+GROUP_PREFERENCE = ("testing", "test", "validation", "training")
+
+
+def resolve_group(path, requested):
+    """Pick which group to read, so that any generator's output just works.
+
+    generate_test_data.py writes 'testing'; generate_dataset.py writes
+    'training' and optionally 'validation'.
+    """
+    with h5py.File(path, "r") as handle:
+        available = list(handle.keys())
+    if requested != "auto":
+        if requested not in available:
+            raise KeyError(f"Group '{requested}' not found in {path}. "
+                           f"Available: {available}")
+        return requested
+    for candidate in GROUP_PREFERENCE:
+        if candidate in available:
+            return candidate
+    raise KeyError(f"{path} contains no recognised group. "
+                   f"Available: {available}")
 
 
 def load_split(path, group):
@@ -164,22 +189,31 @@ def plot_diagnostics(noises, waveforms, attrs, outpath, max_samples=400):
     # (a) Amplitude distribution of the whitened noise -----------------------
     ax = axes[0][0]
     flat = noise_subset.ravel()
-    ax.hist(flat, bins=200, density=True, color="tab:grey",
+    sigma = flat.std()
+    # NOTE: pycbc's whitening does not return unit variance. It returns a
+    # standard deviation of sqrt(f_s/2), about 32 at 2048 Hz, which is the
+    # origin of the factor 32 hard-coded in the original CASTOR code. What
+    # matters is that the distribution is Gaussian in SHAPE and that the same
+    # convention is used at training and application time, so the amplitude is
+    # normalised out here and reported in the title instead.
+    ax.hist(flat / sigma, bins=200, density=True, color="tab:grey",
             alpha=0.8, label="whitened noise")
     grid = np.linspace(-5, 5, 400)
     ax.plot(grid, np.exp(-0.5 * grid ** 2) / np.sqrt(2 * np.pi),
-            "r--", lw=1.5, label="unit Gaussian")
+            "r--", lw=1.5, label="Gaussian")
     ax.set_xlim(-5, 5)
-    ax.set_xlabel("Whitened strain")
+    ax.set_xlabel(r"Whitened strain / $\sigma$")
     ax.set_ylabel("Density")
-    ax.set_title(f"(a) Noise amplitude\nmean={flat.mean():+.3f}, "
-                 f"std={flat.std():.3f}  (target: 0, 1)")
+    ax.set_title(f"(a) Noise amplitude\nmean={flat.mean():+.3g}, "
+                 f"std={sigma:.2f} "
+                 f"(expect $\\sqrt{{f_s/2}}$ = {np.sqrt(sample_rate / 2):.1f})")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25)
 
     # (b) Amplitude spectral density of the whitened noise -------------------
-    # For unit-variance white noise the one-sided ASD is sqrt(2/f_s), shown as
-    # the dashed reference line. Flatness above f_low is the thing to check.
+    # White noise of standard deviation sigma has a one-sided ASD of
+    # sigma*sqrt(2/f_s), drawn as the dashed line. Flatness above f_low is what
+    # is being checked here, not the absolute level.
     ax = axes[0][1]
     spectra = np.fft.rfft(noise_subset, axis=-1)
     n_time = noise_subset.shape[-1]
@@ -187,8 +221,8 @@ def plot_diagnostics(noises, waveforms, attrs, outpath, max_samples=400):
     asd = np.sqrt(psd.mean(axis=(0, 1)))
     freqs = np.fft.rfftfreq(n_time, d=1.0 / sample_rate)
     ax.loglog(freqs[1:], asd[1:], lw=0.8, color="tab:blue")
-    ax.axhline(np.sqrt(2.0 / sample_rate), color="r", ls="--", lw=1.5,
-               label=r"white, unit variance: $\sqrt{2/f_s}$")
+    ax.axhline(sigma * np.sqrt(2.0 / sample_rate), color="r", ls="--", lw=1.5,
+               label=r"white at the measured $\sigma$")
     ax.axvline(f_low, color="k", ls=":", lw=1.5,
                label=f"cutoff {f_low:g} Hz")
     ax.set_xlabel("Frequency [Hz]")
@@ -204,7 +238,7 @@ def plot_diagnostics(noises, waveforms, attrs, outpath, max_samples=400):
     norms = np.sqrt(np.sum(waveforms.astype(np.float64) ** 2, axis=(1, 2)))
     median = np.median(norms)
     fractional_spread = norms.std() / max(median, 1e-30)
-    if fractional_spread < 1e-6:
+    if fractional_spread < 1e-6 and abs(median - sigma) < 0.5:
         # Every norm is identical to floating-point precision. A histogram here
         # would just zoom into rounding noise, so state the value instead.
         ax.axvline(median, color="tab:orange", lw=3, label=f"all = {median:.4f}")
@@ -215,9 +249,12 @@ def plot_diagnostics(noises, waveforms, attrs, outpath, max_samples=400):
         ax.hist(norms, bins=60, color="tab:orange", alpha=0.85)
         ax.axvline(median, color="k", ls="--", lw=1.5,
                    label=f"median = {median:.3f}")
-    # After whitening, the sum of squares of the signal IS its squared
-    # matched-filter SNR, so a correctly normalised waveform has norm 1.
-    ax.axvline(1.0, color="r", ls=":", lw=1.5, label="target = 1")
+    # A signal of matched-filter SNR rho in noise of per-sample standard
+    # deviation sigma satisfies ||rho*w|| = rho*sigma, so a waveform stored at
+    # unit network SNR has norm sigma -- NOT 1. The target therefore tracks the
+    # measured noise amplitude.
+    ax.axvline(sigma, color="r", ls=":", lw=1.5,
+               label=f"target = $\\sigma$ = {sigma:.1f}")
     ax.set_xlabel(r"$\|w\|$ over both detectors")
     ax.set_ylabel("Count")
     ax.set_title("(c) Stored waveform norm\n(all normalised to network SNR = 1)")
@@ -261,11 +298,10 @@ def main():
                         help="Output path stem. Two PNGs are written: "
                              "<stem>_examples.png and <stem>_diagnostics.png. "
                              "Default: the input filename without its extension.")
-    parser.add_argument("-g", "--group", type=str, default="training",
-                        help="Which split to plot. Default: training. The "
-                             "'validation' split is present only if "
-                             "generate_dataset.py was run with "
-                             "--validation-samples.")
+    parser.add_argument("-g", "--group", type=str, default="auto",
+                        help="Which split to plot. Default: auto, which takes "
+                             "the first of 'testing', 'test', 'validation', "
+                             "'training' that the file contains.")
     parser.add_argument("--snr", type=float, default=15.0,
                         help="Network SNR at which to inject the example "
                              "signal. Default: 15.")
@@ -284,7 +320,8 @@ def main():
         return
 
     try:
-        noises, waveforms, attrs = load_split(args.input_file, args.group)
+        group = resolve_group(args.input_file, args.group)
+        noises, waveforms, attrs = load_split(args.input_file, group)
     except KeyError as exc:
         # Most commonly: asking for 'validation' in a file generated without
         # --validation-samples. Report it plainly rather than as a traceback.

@@ -103,7 +103,6 @@ Copyright 2022 Ondrej Zelenka. Modifications copyright 2026 Chayan Chatterjee.
 """
 
 from argparse import ArgumentParser
-import copy
 import glob
 import json
 import logging
@@ -284,18 +283,6 @@ class InjectionDataset(torch.utils.data.Dataset):
         self.deterministic = deterministic
         self._rng = None
 
-    def as_deterministic(self):
-        """A view of the same data that yields identical examples every epoch.
-
-        The returned object shares the underlying tensors, so this costs no
-        extra memory. Used to build a stable validation split.
-        """
-        clone = copy.copy(self)
-        clone.deterministic = True
-        clone.fixed_pairing = True
-        clone._rng = None
-        return clone
-
     @property
     def rng(self):
         """A generator that is distinct in every DataLoader worker process.
@@ -345,16 +332,22 @@ def load_group(path, group):
         return handle[group]["noises"][()], handle[group]["waveforms"][()]
 
 
-def build_datasets(files, snr_range, store_device, validation_fraction, seed,
-                   fixed_pairing=False):
+def build_datasets(files, snr_range, store_device, seed, fixed_pairing=False):
     """Load every file and return (training_dataset, validation_dataset).
 
-    Files that contain a ``validation`` group contribute to the validation set.
-    If NO file has one -- which is the default output of ``generate_dataset.py``
-    now that ``--validation-samples`` is opt-in -- a random fraction of the
-    training data is held out instead, and a warning is issued.
+    A ``validation`` group is REQUIRED. It must come from
+    ``generate_dataset.py --validation-samples N_INJ N_NOISE``, which draws
+    fresh noise realisations and fresh source parameters for it, so the two
+    sets share nothing.
+
+    There is deliberately no option to carve a validation set out of the
+    training arrays. Under random pairing a training example draws any noise
+    segment from its pool, so an index-based holdout leaks outright; and even a
+    clean array split is optimistic for real noise, whose slices overlap by
+    50%. Generating the split properly is the only arrangement that is correct
+    in both cases, so it is the only one offered.
     """
-    train_parts, valid_parts = [], []
+    raw_files, valid_parts = [], []
     total_injections = total_samples = 0
 
     for index, path in enumerate(files):
@@ -362,11 +355,9 @@ def build_datasets(files, snr_range, store_device, validation_fraction, seed,
         if training is None:
             raise KeyError(f"File '{path}' has no 'training' group.")
         noises, waveforms = training
+        raw_files.append((path, noises, waveforms))
         total_samples += len(noises)
         total_injections += len(waveforms)
-        train_parts.append(InjectionDataset(
-            noises, waveforms, snr_range, store_device, seed=seed + index,
-            fixed_pairing=fixed_pairing))
         logging.info("  %s: %i samples (%i injections, %i pure noise)",
                      os.path.basename(path), len(noises), len(waveforms),
                      len(noises) - len(waveforms))
@@ -380,8 +371,6 @@ def build_datasets(files, snr_range, store_device, validation_fraction, seed,
                 v_noises, v_waveforms, snr_range, store_device,
                 seed=seed + 10_000 + index, deterministic=True))
 
-    train_ds = torch.utils.data.ConcatDataset(train_parts)
-
     signal_fraction = total_injections / max(total_samples, 1)
     logging.info("Loaded %i training samples from %i file(s); "
                  "%.1f%% carry a signal.",
@@ -393,41 +382,30 @@ def build_datasets(files, snr_range, store_device, validation_fraction, seed,
                         "Consider regenerating with matched injection and "
                         "noise counts.", 100.0 * signal_fraction)
 
+    # ---- the preferred path: a validation split generated as such ----------
     if valid_parts:
+        train_parts = [
+            InjectionDataset(noises, waveforms, snr_range, store_device,
+                             seed=seed + index, fixed_pairing=fixed_pairing)
+            for index, (_, noises, waveforms) in enumerate(raw_files)]
         valid_ds = torch.utils.data.ConcatDataset(valid_parts)
         logging.info("Using the stored validation split (%i samples).",
                      len(valid_ds))
-        return train_ds, valid_ds
+        return torch.utils.data.ConcatDataset(train_parts), valid_ds
 
-    # Fall back to holding out part of the training data. The held-out indices
-    # are served from deterministic views of the SAME tensors, so validation
-    # examples are stable across epochs while training examples stay randomised.
-    n_total = len(train_ds)
-    n_valid = int(round(validation_fraction * n_total))
-    if n_valid < 1:
-        raise ValueError("No validation group found and --validation-fraction "
-                         "is too small to hold anything out.")
-    mirror_ds = torch.utils.data.ConcatDataset(
-        [part.as_deterministic() for part in train_parts])
-    generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(n_total, generator=generator).tolist()
-    valid_indices, train_indices = order[:n_valid], order[n_valid:]
-    train_ds = torch.utils.data.Subset(train_ds, train_indices)
-    valid_ds = torch.utils.data.Subset(mirror_ds, valid_indices)
-    logging.warning(
-        "No 'validation' group found; holding out %i of %i training samples "
-        "(%.0f%%) at random.", n_valid, n_total,
-        100.0 * validation_fraction)
-    # NOTE (important for real noise): prepare_real_noise.py cuts slices that
-    # overlap by 50%, so neighbouring samples are near-duplicates. A random
-    # holdout then puts nearly identical data on both sides of the split and
-    # the validation loss becomes optimistic. For real-noise runs, generate a
-    # genuine validation split instead, with
-    #     generate_dataset.py --validation-samples N_INJ N_NOISE
-    # built from noise that prepare_real_noise.py split off beforehand.
-    logging.warning("If this is real-noise data with overlapping slices, the "
-                    "random holdout is optimistic; see the note in the source.")
-    return train_ds, valid_ds
+    # ---- no validation group: refuse rather than improvise -----------------
+    listing = "\n".join(f"    {os.path.basename(path)}"
+                        for path, _, _ in raw_files)
+    raise KeyError(
+        "No 'validation' group found in any input file:\n"
+        f"{listing}\n\n"
+        "Regenerate the dataset with a validation split, for example:\n"
+        "    python generate_dataset.py -o <output>.h5 \\\n"
+        "        --training-samples 10000 10000 \\\n"
+        "        --validation-samples 2000 2000\n\n"
+        "For real noise, build the validation half from strain that\n"
+        "prepare_real_noise.py split off beforehand, so that no stretch of\n"
+        "data is shared with the training set.")
 
 
 # =============================================================================
@@ -872,10 +850,6 @@ def main():
                             "single class and invites the network to memorise "
                             "them; the default random pairing avoids that. Use "
                             "only when exact per-segment PSD matching matters.")
-    group.add_argument("--validation-fraction", type=float, default=0.1,
-                       help="Fraction of training data held out for validation "
-                            "when the file has no 'validation' group. "
-                            "Default: 0.1.")
 
     group = parser.add_argument_group("runtime")
     group.add_argument("--train-device", type=str, default="cpu",
@@ -965,9 +939,13 @@ def main():
     seed_everything(args.seed)
     logging.info("Found %i dataset file(s).", len(files))
 
-    train_ds, valid_ds = build_datasets(
-        files, tuple(args.snr), args.store_device, args.validation_fraction,
-        args.seed, fixed_pairing=args.fixed_pairing)
+    try:
+        train_ds, valid_ds = build_datasets(
+            files, tuple(args.snr), args.store_device, args.seed,
+            fixed_pairing=args.fixed_pairing)
+    except KeyError as exc:
+        print(f"\nError: {exc.args[0]}", file=sys.stderr)
+        sys.exit(1)
 
     # Infer the input shape from the data rather than assuming it, so that a
     # non-default --sample-length in generate_dataset.py is picked up.

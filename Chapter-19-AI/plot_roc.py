@@ -145,11 +145,11 @@ def resolve_group(path, requested):
             raise KeyError(f"Group '{requested}' not found in {path}. "
                            f"Available: {available}")
         return requested
-    for candidate in ("test", "validation", "training"):
+    for candidate in ("testing", "test", "validation", "training"):
         if candidate in available:
             return candidate
-    raise KeyError(f"{path} contains none of 'test', 'validation' or "
-                   f"'training'. Available: {available}")
+    raise KeyError(f"{path} contains none of 'testing', 'test', 'validation' "
+                   f"or 'training'. Available: {available}")
 
 
 def load_split(path, group):
@@ -346,8 +346,9 @@ def main():
                         help="Output path stem. Default: roc.")
     parser.add_argument("-g", "--group", type=str, default="auto",
                         help="Which group of the file to evaluate. Default: "
-                             "auto, which takes the first of 'test', "
-                             "'validation', 'training' that is present. A "
+                             "auto, which takes the first of 'testing', "
+                             "'test', 'validation', 'training' that is "
+                             "present. A "
                              "held-out test file generated on its own will "
                              "contain a single group named 'training'; that is "
                              "just the default group name and is evaluated "

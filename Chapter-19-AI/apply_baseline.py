@@ -51,18 +51,6 @@ Requires: torch, numpy, h5py, pycbc, tqdm, and train_baseline.py alongside.
         --checkpoint runs/baseline_gaussian/best_state_dict.pt \
         --device cuda --verbose
 
-    # Re-use a whitened file prepared earlier, skipping the whitening stage.
-    # Only do this if that file was whitened with the settings below.
-    python apply_baseline.py \
-        --inputfile  /path/debug_white_ds4_fg_20Hz.hdf \
-        --outputfile /path/output_triggers_baseline_ds4_fg.hdf \
-        --checkpoint runs/baseline_gaussian/best_state_dict.pt \
-        --white \
-        --score-threshold 0.0 \
-        --cluster-threshold 0.35 \
-        --eval-workers 6 \
-        --batch-size 1024 \
-        --device cuda --verbose
 
 Then score the result with the MLGWSC-1 tooling, e.g.
 
@@ -393,7 +381,7 @@ def main():
                        help="Welch segment length for the PSD estimate. "
                             "Default: 4.")
     group.add_argument("--whitening-max-filter-duration", type=float,
-                       default=0.25,
+                       default=4.0,
                        help="Whitening filter length. Default: 0.25, matching "
                             "the training data.")
     group.add_argument("--low-frequency-cutoff", type=float, default=15.0,
