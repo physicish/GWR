@@ -68,15 +68,26 @@ Requires: torch, numpy, h5py, tqdm
     python train_baseline.py -d data_o3_files/ -o runs/baseline_o3 --verbose
     python train_baseline.py -d "data_o3_*.h5" -o runs/baseline_o3 --verbose
 
-    # Quick smoke test before committing to a long run
-    python train_baseline.py -d data_gaussian.h5 -o runs/smoke --epochs 1 --verbose
-
     # Reproduce the overfitting failure deliberately, for the chapter figure
     python train_baseline.py -d data_gaussian.h5 -o runs/overfit \
         --fixed-pairing --weight-decay 0 --patience 0 --lr-schedule none \
         --epochs 200 --verbose
 
-    # Resume from, or fine-tune, an existing checkpoint
+    # Continue an interrupted run, exactly where it stopped
+    python train_baseline.py -d data_gaussian.h5 -o runs/baseline_gaussian \
+        --resume runs/baseline_gaussian/last_state_dict.pt --verbose
+
+    # ... and train further than originally planned: raise --epochs
+    python train_baseline.py -d data_gaussian.h5 -o runs/baseline_gaussian \
+        --resume runs/baseline_gaussian/last_state_dict.pt --epochs 400 --verbose
+
+    # Continue a checkpoint written before --resume existed: give the epoch it
+    # reached, so the schedule and the loss history carry on correctly
+    python train_baseline.py -d data_o3.h5 -o runs/baseline_o3 \
+        --weights runs/baseline_o3/last_state_dict.pt \
+        --start-epoch 120 --epochs 250 --verbose
+
+    # Fine-tune on different data, starting a NEW run from trained weights
     python train_baseline.py -d data_o3.h5 -o runs/finetune \
         --weights runs/baseline_gaussian/best_state_dict.pt --verbose
 
@@ -84,8 +95,10 @@ Outputs written to the ``-o`` directory:
     losses.txt          epoch, train loss/accuracy, validation loss/accuracy
     loss_curve.pdf      publication-quality training/validation loss curve
     loss_curve.png      the same figure as a raster image
-    best_state_dict.pt  weights at the lowest validation loss
-    last_state_dict.pt  weights after the final epoch
+    best_state_dict.pt  weights at the lowest validation loss; the artefact
+                        to deploy, and what apply_baseline.py expects
+    last_state_dict.pt  weights after the most recent epoch, PLUS the
+                        optimizer, schedule and counters needed by --resume
     config.json         the full run configuration, for reproducibility
 
 The loss curve is drawn automatically when training finishes. To restyle it
@@ -482,9 +495,70 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def save_checkpoint(path, model):
-    """Store weights together with the architecture needed to rebuild them."""
-    torch.save({"state_dict": model.state_dict(), "config": model.config}, path)
+def torch_load(path, device):
+    """torch.load that works across versions.
+
+    PyTorch 2.6 changed the default of ``weights_only`` to True, which rejects
+    the NumPy generator state stored in the resume payload. Older releases do
+    not accept the argument at all.
+    """
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def save_checkpoint(path, model, training_state=None):
+    """Store weights, the architecture needed to rebuild them, and optionally
+    the state required to resume training.
+
+    ``best_state_dict.pt`` is written without ``training_state``: it is the
+    artefact for deployment, and carries only what apply_baseline.py and
+    plot_roc.py need. ``last_state_dict.pt`` is written WITH it, and is the
+    file to pass to --resume.
+    """
+    payload = {"state_dict": model.state_dict(), "config": model.config}
+    if training_state is not None:
+        payload["training_state"] = training_state
+    torch.save(payload, path)
+
+
+def capture_training_state(optimizer, scheduler, epoch, best_loss, best_epoch,
+                           epochs_without_improvement, total_epochs):
+    """Everything needed to continue a run exactly where it stopped.
+
+    The optimizer moments matter as much as the weights: AdamW carries running
+    first and second moment estimates, and discarding them restarts the
+    adaptive step sizes from zero, which produces a visible transient in the
+    loss. The scheduler position matters for the same reason.
+    """
+    state = {
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": epoch,
+        "best_loss": best_loss,
+        "best_epoch": best_epoch,
+        "epochs_without_improvement": epochs_without_improvement,
+        "total_epochs": total_epochs,
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def load_training_state(path, device):
+    """Read the resume payload from a checkpoint.
+
+    Returns ``(state, keys)``. ``state`` is None when the file carries no
+    resume payload, and ``keys`` lists what it does contain, so the caller can
+    diagnose the case rather than guess at it.
+    """
+    payload = torch_load(path, device)
+    if not isinstance(payload, dict):
+        return None, []
+    return payload.get("training_state"), sorted(payload.keys())
 
 
 def load_checkpoint(path, device, fallback_config=None):
@@ -495,7 +569,7 @@ def load_checkpoint(path, device, fallback_config=None):
     other tooling can also be loaded, but only if ``fallback_config`` describes
     the architecture it belongs to.
     """
-    payload = torch.load(path, map_location=device)
+    payload = torch_load(path, device)
     if isinstance(payload, dict) and "state_dict" in payload and "config" in payload:
         model = BaselineTransformer(**payload["config"])
         model.load_state_dict(payload["state_dict"])
@@ -677,7 +751,8 @@ def train(model, train_ds, valid_ds, output_dir, device, batch_size=128,
           learning_rate=1e-4, epochs=50, clip_norm=100.0, num_workers=0,
           save_every_epoch=False, verbose=False, make_plot=True,
           plot_accuracy=False, log_loss=False, weight_decay=1e-2,
-          patience=20, lr_schedule="cosine"):
+          patience=20, lr_schedule="cosine", resume_state=None,
+          start_epoch=1):
     """Fit the model, writing checkpoints and a loss history to ``output_dir``."""
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
@@ -715,9 +790,79 @@ def train(model, train_ds, valid_ds, output_dir, device, batch_size=128,
     best_loss = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
-    with open(losses_path, "w", buffering=1) as history:
-        history.write("# epoch  train_loss  train_acc  valid_loss  valid_acc\n")
-        for epoch in tqdm(range(1, epochs + 1), desc="Training",
+
+    if resume_state is None and start_epoch > 1:
+        # Continuing a checkpoint that predates --resume. The weights are
+        # restored but the optimizer moments are not, because they were never
+        # written; AdamW therefore rebuilds its step sizes over the first few
+        # hundred updates, which usually shows as a small bump in the loss.
+        logging.warning(
+            "Continuing from epoch %i with a FRESH optimizer: this checkpoint "
+            "carries no optimizer state. Expect a transient in the loss while "
+            "AdamW re-estimates its moments. Consider a lower "
+            "--learning-rate, or --lr-schedule none, to limit the "
+            "disturbance to an already-converged model.", start_epoch)
+        # Advance the schedule to where the run had reached, so the learning
+        # rate continues from the right point instead of restarting at its
+        # peak value.
+        if scheduler is not None and lr_schedule == "cosine":
+            for _ in range(start_epoch - 1):
+                scheduler.step()
+            logging.info("Advanced the cosine schedule to epoch %i; learning "
+                         "rate is now %.3g.", start_epoch - 1,
+                         optimizer.param_groups[0]["lr"])
+
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
+        if scheduler is not None and resume_state.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_state["scheduler"])
+        start_epoch = int(resume_state["epoch"]) + 1
+        best_loss = float(resume_state["best_loss"])
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        epochs_without_improvement = int(
+            resume_state.get("epochs_without_improvement", 0))
+
+        previous_total = resume_state.get("total_epochs")
+        if (lr_schedule == "cosine" and previous_total is not None
+                and previous_total != epochs):
+            logging.warning(
+                "The run being resumed had --epochs %s but this one has %s. "
+                "The cosine schedule is defined over the total, so its shape "
+                "changes from here on.", previous_total, epochs)
+
+        # Restoring the generators makes a resumed run follow the same
+        # trajectory as an uninterrupted one. Failure here is not fatal: a
+        # different device layout only costs exact reproducibility.
+        try:
+            torch_rng = resume_state["torch_rng"]
+            torch.set_rng_state(torch_rng.cpu() if hasattr(torch_rng, "cpu")
+                                else torch_rng)
+            np.random.set_state(resume_state["numpy_rng"])
+            if torch.cuda.is_available() and "cuda_rng" in resume_state:
+                torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
+        except Exception as exc:                          # noqa: BLE001
+            logging.warning("Could not restore the random state (%s); the run "
+                            "continues but will not reproduce exactly.", exc)
+
+        logging.info("Resuming at epoch %i of %i. Best so far: %.5f at "
+                     "epoch %i.", start_epoch, epochs, best_loss, best_epoch)
+        if start_epoch > epochs:
+            logging.warning(
+                "The checkpoint is already at epoch %i, so --epochs %i leaves "
+                "nothing to do. Raise --epochs to continue.",
+                start_epoch - 1, epochs)
+            return model
+
+    # Append when resuming, so the loss curve spans the whole run rather than
+    # only the final leg.
+    append = (resume_state is not None or start_epoch > 1) and \
+        os.path.isfile(losses_path)
+    with open(losses_path, "a" if append else "w", buffering=1) as history:
+        if not append:
+            history.write(
+                "# epoch  train_loss  train_acc  valid_loss  valid_acc\n")
+        for epoch in tqdm(range(start_epoch, epochs + 1), desc="Training",
+                          initial=start_epoch - 1, total=epochs,
                           disable=not verbose, ascii=True):
             train_loss, train_acc = run_epoch(
                 model, train_loader, loss_fn, device, optimizer=optimizer,
@@ -738,16 +883,12 @@ def train(model, train_ds, valid_ds, output_dir, device, batch_size=128,
                 else:
                     scheduler.step()
 
-            save_checkpoint(last_path, model)
-            if save_every_epoch:
-                save_checkpoint(
-                    os.path.join(output_dir, f"state_dict_e_{epoch:04d}.pt"),
-                    model)
             # NOTE (deliberate simplification): the "best" model is the one with
             # the lowest validation loss. That is the standard machine-learning
             # criterion, and it is not the quantity we care about -- which is
             # sensitivity at a fixed false-alarm rate. The chapter returns to
             # this once a background has been estimated.
+            stop_early = False
             if valid_loss < best_loss:
                 best_loss = valid_loss
                 best_epoch = epoch
@@ -764,7 +905,23 @@ def train(model, train_ds, valid_ds, output_dir, device, batch_size=128,
                         "Early stopping at epoch %i: no improvement for %i "
                         "epochs (best was epoch %i, loss %.5f).",
                         epoch, patience, best_epoch, best_loss)
-                    break
+                    stop_early = True
+
+            # Saved AFTER the best-model and patience bookkeeping, so the
+            # resume payload reflects the epoch just finished rather than the
+            # one before it. Written on the early-stopping epoch too, so the
+            # checkpoint always describes where the run actually stopped.
+            save_checkpoint(last_path, model,
+                            training_state=capture_training_state(
+                                optimizer, scheduler, epoch, best_loss,
+                                best_epoch, epochs_without_improvement,
+                                epochs))
+            if save_every_epoch:
+                save_checkpoint(
+                    os.path.join(output_dir, f"state_dict_e_{epoch:04d}.pt"),
+                    model)
+            if stop_early:
+                break
 
     logging.info("Training finished. Best validation loss %.5f at epoch %i "
                  "-> %s", best_loss, best_epoch, best_path)
@@ -803,11 +960,28 @@ def main():
                         help="Directory for checkpoints and the loss history. "
                              "Created if it does not exist.")
     parser.add_argument("-w", "--weights", type=str, default=None,
-                        help="Checkpoint to initialise from, for fine-tuning. "
-                             "Default: random initialisation.")
+                        help="Checkpoint to initialise the WEIGHTS from, for "
+                             "fine-tuning: the optimizer, schedule and epoch "
+                             "counter all start fresh. To continue an "
+                             "interrupted run instead, use --resume.")
+    parser.add_argument("--start-epoch", type=int, default=1, metavar="N",
+                        help="Epoch to continue from when using --weights on a "
+                             "checkpoint that has no resume payload, such as "
+                             "one written before --resume existed. Set it to "
+                             "the last completed epoch in losses.txt; the "
+                             "learning-rate schedule is advanced to match and "
+                             "the history is appended to. The optimizer state "
+                             "cannot be recovered and starts fresh.")
+    parser.add_argument("--resume", type=str, default=None, metavar="PATH",
+                        help="Continue an interrupted run from "
+                             "last_state_dict.pt. Restores the optimizer "
+                             "moments, learning-rate schedule, epoch counter, "
+                             "best-so-far loss and early-stopping counter, and "
+                             "appends to the existing losses.txt. Raise "
+                             "--epochs to train beyond the original budget.")
 
     group = parser.add_argument_group("signal population")
-    group.add_argument("-s", "--snr", type=float, nargs=2, default=(5.0, 15.0),
+    group.add_argument("-s", "--snr", type=float, nargs=2, default=(7.0, 30.0),
                        metavar=("LOW", "HIGH"),
                        help="Range of network SNR for injected signals. "
                             "Default: 5 15.")
@@ -826,9 +1000,9 @@ def main():
                        help="Dropout probability. Default: 0.1.")
 
     group = parser.add_argument_group("optimisation")
-    group.add_argument("--epochs", type=int, default=50,
+    group.add_argument("--epochs", type=int, default=250,
                        help="Number of passes over the data. Default: 50.")
-    group.add_argument("--batch-size", type=int, default=128,
+    group.add_argument("--batch-size", type=int, default=1024,
                        help="Mini-batch size. Default: 128.")
     group.add_argument("--learning-rate", type=float, default=1e-4,
                        help="Adam learning rate. Default: 1e-4.")
@@ -837,7 +1011,7 @@ def main():
     group.add_argument("--weight-decay", type=float, default=1e-2,
                        help="AdamW weight decay. Default: 1e-2. Set 0 to "
                             "disable regularisation.")
-    group.add_argument("--patience", type=int, default=20,
+    group.add_argument("--patience", type=int, default=25,
                        help="Stop if the validation loss has not improved for "
                             "this many epochs. Default: 20. Set 0 to disable "
                             "early stopping and always run --epochs.")
@@ -918,6 +1092,18 @@ def main():
               "given.", file=sys.stderr)
         sys.exit(1)
 
+    if args.start_epoch > 1 and not args.weights:
+        print("\nError: --start-epoch applies to --weights. Use --resume for "
+              "a checkpoint that carries its own epoch counter.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.resume and args.weights:
+        print("\nError: --resume and --weights are mutually exclusive. "
+              "--resume continues a run; --weights starts a new one from "
+              "existing weights.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         files = resolve_dataset_files(args.dataset_file)
     except FileNotFoundError as exc:
@@ -926,7 +1112,8 @@ def main():
 
     os.makedirs(args.output_directory, exist_ok=True)
     losses_path = os.path.join(args.output_directory, "losses.txt")
-    if os.path.isfile(losses_path) and not args.force:
+    if (os.path.isfile(losses_path) and not args.force and not args.resume
+            and args.start_epoch == 1):
         print(f"\nError: '{losses_path}' exists. Use --force to overwrite.",
               file=sys.stderr)
         sys.exit(1)
@@ -959,10 +1146,42 @@ def main():
         n_detectors=n_detectors, sample_length=sample_length,
         patch_size=args.patch_size, d_model=args.d_model,
         n_heads=args.n_heads, n_layers=args.n_layers, dropout=args.dropout)
-    if args.weights:
+    resume_state = None
+    if args.resume:
+        model = load_checkpoint(args.resume, device,
+                                fallback_config=model_config)
+        resume_state, present_keys = load_training_state(args.resume, device)
+        if resume_state is None:
+            print(
+                f"\nError: '{args.resume}' has no resume payload.\n"
+                f"  It contains: {', '.join(present_keys) or '(not a dict)'}\n"
+                f"\nTwo things cause this:\n"
+                f"  1. The checkpoint was written before --resume existed. "
+                f"Older runs saved\n     weights and architecture only, with "
+                f"no optimizer or schedule state.\n"
+                f"     This is much the most likely case for a run started "
+                f"earlier.\n"
+                f"  2. It is best_state_dict.pt, which stores weights only by "
+                f"design.\n"
+                f"\nAn optimizer state that was never saved cannot be "
+                f"recovered, but the run can\nstill be continued from its "
+                f"weights. Give the epoch it had reached so the\nlearning-rate "
+                f"schedule and the loss history carry on from the right "
+                f"place:\n"
+                f"\n    python train_baseline.py -d <data> -o "
+                f"{os.path.dirname(args.resume) or '<run-dir>'} \\\n"
+                f"        --weights {args.resume} \\\n"
+                f"        --start-epoch <last completed epoch> --epochs "
+                f"{args.epochs}\n"
+                f"\nThe last completed epoch is the final entry in "
+                f"losses.txt. Checkpoints written\nfrom now on will resume "
+                f"without this.", file=sys.stderr)
+            sys.exit(1)
+        logging.info("Resuming from %s", args.resume)
+    elif args.weights:
         model = load_checkpoint(args.weights, device,
                                 fallback_config=model_config)
-        logging.info("Initialised from %s", args.weights)
+        logging.info("Initialised weights from %s", args.weights)
     else:
         model = BaselineTransformer(**model_config).to(device)
     logging.info("Model has %s trainable parameters.",
@@ -982,7 +1201,8 @@ def main():
           verbose=args.verbose, make_plot=not args.no_plot,
           plot_accuracy=args.plot_accuracy, log_loss=args.log_loss,
           weight_decay=args.weight_decay, patience=args.patience,
-          lr_schedule=args.lr_schedule)
+          lr_schedule=args.lr_schedule, resume_state=resume_state,
+          start_epoch=args.start_epoch)
 
 
 if __name__ == "__main__":
