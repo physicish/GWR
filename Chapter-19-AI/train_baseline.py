@@ -1026,7 +1026,7 @@ def main():
                             "only when exact per-segment PSD matching matters.")
 
     group = parser.add_argument_group("runtime")
-    group.add_argument("--train-device", type=str, default="cpu",
+    group.add_argument("--train-device", type=str, default="cuda",
                        help="Device for the network, e.g. 'cuda'. Default: cpu.")
     group.add_argument("--store-device", type=str, default="cpu",
                        help="Device holding the dataset. 'cuda' is fastest if "
