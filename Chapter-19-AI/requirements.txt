@@ -1,0 +1,30 @@
+# Chapter 19 companion code -- pinned dependencies.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#   pip install -e .
+#
+# Install PyTorch first if you need a specific CUDA build; see the main README.
+
+# --- core numerics ---
+numpy>=1.24,<2.0
+scipy>=1.10
+h5py>=3.8
+tqdm>=4.65
+
+# --- gravitational-wave data handling ---
+# PyCBC pulls in lalsuite, which supplies the waveform models and the
+# whitening routines used throughout.
+pycbc>=2.3.0
+lalsuite>=7.20
+
+# --- machine learning ---
+torch>=2.0
+# ml4gw provides the on-the-fly waveform generation and GPU whitening used
+# by stage 05. It depends on torch, so install torch first if you need a
+# particular CUDA build.
+ml4gw>=0.7.0
+
+# --- plotting ---
+matplotlib>=3.7

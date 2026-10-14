@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwsearch-chapter19"
+version = "1.0.0"
+description = "Transformer-based gravitational-wave search experiments accompanying Chapter 19"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["gwsearch"]
